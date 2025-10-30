@@ -27,6 +27,8 @@ import lime.lime_tabular
 import shap
 import plotly.express as px
 import plotly.graph_objects as go
+import json
+import ast
 
 # Global settings and random seeds for reproducibility
 RANDOM_SEED = 100
@@ -39,6 +41,45 @@ sns.set(style="whitegrid")
 pd.set_option('display.precision', 8)
 np.set_printoptions(precision=8)
 
+# Configuration Constants - Best Practice: Extract magic numbers
+class Config:
+    """Configuration constants for the framework"""
+    # Cross-validation
+    CV_SPLITS = 5
+    TEST_SIZE = 0.25
+    TRAIN_SIZE = 0.75
+
+    # Feature engineering
+    DEFAULT_LAGS = [3, 6, 9, 12, 18]
+    DEFAULT_ROLLING_WINDOWS = [3, 6, 9]
+
+    # SHAP computation
+    SHAP_SAMPLE_SIZE = 50
+    SHAP_TEST_SUBSET = 50
+
+    # Optuna trials
+    WEIGHT_OPTIMIZATION_TRIALS = 15
+    META_MODEL_TRIALS = 25
+
+    # DQN parameters
+    DQN_GAMMA = 0.99
+    DQN_EPSILON = 1.0
+    DQN_EPSILON_DECAY = 0.995
+    DQN_EPSILON_MIN = 0.01
+    DQN_LEARNING_RATE = 0.0001
+    DQN_MEMORY_SIZE = 1500
+    DQN_BATCH_SIZE = 45
+
+    # Backtesting
+    BACKTEST_WINDOW_SIZE = 302
+    BACKTEST_STEP = 4
+
+    # Neural network
+    NN_HIDDEN_LAYER_1 = 64
+    NN_HIDDEN_LAYER_2 = 32
+    NN_DROPOUT_RATE = 0.2
+    NN_L2_REG = 0.01
+
 
 ###############################################################################
 #                            DATA PROCESSING CLASS                            #
@@ -46,27 +87,80 @@ np.set_printoptions(precision=8)
 class DataProcessor:
     """
     Processes and engineers features from sector and macroeconomic data.
+    Includes input validation and error handling.
     """
     def __init__(self):
         pass
 
     def compute_returns(self, sector_data: pd.DataFrame) -> pd.DataFrame:
         """
-        Compute log returns for sector data.
+        Compute log returns for sector data with input validation.
+
+        Args:
+            sector_data: DataFrame with 'date' column and numeric price columns
+
+        Returns:
+            DataFrame with log returns
+
+        Raises:
+            ValueError: If required columns are missing or data is invalid
         """
-        sector_data['date'] = pd.to_datetime(sector_data['date'])
+        # Input validation
+        if sector_data is None or sector_data.empty:
+            raise ValueError("sector_data cannot be None or empty")
+        if 'date' not in sector_data.columns:
+            raise ValueError("sector_data must contain a 'date' column")
+
+        sector_data = sector_data.copy()  # Avoid modifying original
+        sector_data['date'] = pd.to_datetime(sector_data['date'], errors='coerce')
+
+        # Check for invalid dates
+        if sector_data['date'].isnull().any():
+            print("Warning: Some dates could not be parsed and were set to NaT")
+
         sector_columns = sector_data.columns.difference(['date'])
-        sector_returns = np.log(sector_data[sector_columns] / sector_data[sector_columns].shift(1))
+
+        # Validate numeric columns
+        for col in sector_columns:
+            if not pd.api.types.is_numeric_dtype(sector_data[col]):
+                raise ValueError(f"Column '{col}' must be numeric")
+
+        # Compute log returns with safety check for negative/zero values
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sector_returns = np.log(sector_data[sector_columns] / sector_data[sector_columns].shift(1))
+
         # Use forward fill only to avoid forward-looking bias
         sector_returns.ffill(inplace=True, axis=0)
         sector_returns['date'] = sector_data['date']
+
         return sector_returns
 
     def preprocess_macro(self, macro_data: pd.DataFrame) -> pd.DataFrame:
         """
         Preprocess macroeconomic data by converting date column to datetime.
+
+        Args:
+            macro_data: DataFrame with 'date' column and macro indicators
+
+        Returns:
+            Preprocessed DataFrame
+
+        Raises:
+            ValueError: If required columns are missing
         """
-        macro_data['date'] = pd.to_datetime(macro_data['date'])
+        # Input validation
+        if macro_data is None or macro_data.empty:
+            raise ValueError("macro_data cannot be None or empty")
+        if 'date' not in macro_data.columns:
+            raise ValueError("macro_data must contain a 'date' column")
+
+        macro_data = macro_data.copy()  # Avoid modifying original
+        macro_data['date'] = pd.to_datetime(macro_data['date'], errors='coerce')
+
+        # Check for invalid dates
+        if macro_data['date'].isnull().any():
+            print("Warning: Some dates in macro_data could not be parsed")
+
         return macro_data
 
     def future_engineering(self, data: pd.DataFrame, lags: list, rolling_windows: list = [3, 6, 9]) -> pd.DataFrame:
@@ -374,7 +468,7 @@ class ModelTrainer:
                 raise ValueError(f"No RFE-selected features for sector: {sector}")
 
             X_train, X_test, y_train, y_test = train_test_split(
-                X[selected_features], y, test_size=0.25, shuffle=False, random_state=RANDOM_SEED)
+                X[selected_features], y, test_size=Config.TEST_SIZE, shuffle=False, random_state=RANDOM_SEED)
 
             sector_results = {'residuals': {}, 'shap_values': {}}
             model_metrics = {}
@@ -383,13 +477,17 @@ class ModelTrainer:
             hyper_sector = self.hyperparameters[self.hyperparameters['sector'] == sector]
             for _, row in hyper_sector.iterrows():
                 model_name = row['model']
-                # Evaluate string parameters safely (assumes trusted input)
-                model_params = eval(row['parameters'])
+                # SECURITY FIX: Use ast.literal_eval instead of eval() to prevent code injection
+                try:
+                    model_params = ast.literal_eval(row['parameters'])
+                except (ValueError, SyntaxError) as e:
+                    print(f"Warning: Could not parse parameters for {model_name}: {e}")
+                    model_params = {}
                 model_params = ModelUtils.adjust_params(model_name, model_params)
                 model_class = ModelUtils.model_classes.get(model_name)
                 if model_class:
                     model = model_class(**model_params)
-                    tscv = TimeSeriesSplit(n_splits=5)
+                    tscv = TimeSeriesSplit(n_splits=Config.CV_SPLITS)
                     cv_scores = cross_val_score(model, X_train, y_train, cv=tscv, scoring="neg_mean_squared_error")
                     print(f"{model_name} CV MSE for {sector}: {np.mean(-cv_scores):.4f}")
                     model.fit(X_train, y_train)
@@ -418,10 +516,11 @@ class ModelTrainer:
                             explainer = shap.LinearExplainer(model, X_train)
                         elif model_name in ['svm', 'mlp']:
                             explainer = shap.KernelExplainer(model.predict, X_train)
-                        # OPTIMIZATION: Reduce SHAP subset from 100 to 50 for faster computation
+                        # OPTIMIZATION: Reduce SHAP subset for faster computation
                         if explainer:
-                            subset_size = min(50, len(X_test))
-                            shap_values = explainer.shap_values(X_test[:subset_size])
+                            subset_size = min(Config.SHAP_TEST_SUBSET, len(X_test))
+                            # Use last subset_size samples to maintain temporal ordering
+                            shap_values = explainer.shap_values(X_test.iloc[-subset_size:])
                             sector_results['shap_values'][model_name] = shap_values
             features[sector] = selected_features
             results[sector] = sector_results
@@ -439,11 +538,13 @@ class EnsembleTrainer:
     Implements stacking ensemble methods and weight optimization.
     """
     def get_base_model_predictions(self, trained_models: dict, X: pd.DataFrame, y: pd.Series, cv: int = 2) -> pd.DataFrame:
-        kf = KFold(n_splits=cv, shuffle=False)
+        # CRITICAL FIX: Use TimeSeriesSplit instead of KFold for time series data
+        # KFold can shuffle data or use future data in training, causing forward-looking bias
+        tscv = TimeSeriesSplit(n_splits=cv)
         oof_predictions = pd.DataFrame(index=X.index)
         for model_name, model in trained_models.items():
             print(f"Generating OOF predictions for {model_name}...")
-            oof_pred = cross_val_predict(model, X, y, cv=kf)
+            oof_pred = cross_val_predict(model, X, y, cv=tscv)
             oof_predictions[model_name] = oof_pred
         return oof_predictions
 
@@ -456,9 +557,9 @@ class EnsembleTrainer:
             mse = mean_squared_error(y_train, weighted_pred)
             return mse
 
-        # OPTIMIZATION: Reduce trials from 20 to 15 for faster computation
+        # Use Config constant for trials
         study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED))
-        study.optimize(objective, n_trials=15, show_progress_bar=False)
+        study.optimize(objective, n_trials=Config.WEIGHT_OPTIMIZATION_TRIALS, show_progress_bar=False)
         best_weights = study.best_params
         total_weight = sum(best_weights.values())
         if total_weight == 0:
@@ -497,9 +598,9 @@ class EnsembleTrainer:
             mse = mean_squared_error(y_train, preds)
             return mse
 
-        # OPTIMIZATION: Reduce trials from 40 to 25 for faster computation
+        # Use Config constant for trials
         study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=RANDOM_SEED))
-        study.optimize(objective, n_trials=25, show_progress_bar=False)
+        study.optimize(objective, n_trials=Config.META_MODEL_TRIALS, show_progress_bar=False)
         best_params = study.best_params
 
         if meta_model_type == "Ridge":
@@ -547,29 +648,39 @@ class EnsembleTrainer:
 class DQNAllocator:
     """
     Deep Q-Network (DQN) for sector allocation with experience replay.
+    Optimized with better memory management and Config constants.
     """
-    def __init__(self, state_size: int, action_size: int, gamma: float = 0.99,
-                 epsilon: float = 1.0, epsilon_decay: float = 0.995, learning_rate: float = 0.0001,
-                 memory_maxlen: int = 1500, seed: int = RANDOM_SEED):
+    def __init__(self, state_size: int, action_size: int,
+                 gamma: float = Config.DQN_GAMMA,
+                 epsilon: float = Config.DQN_EPSILON,
+                 epsilon_decay: float = Config.DQN_EPSILON_DECAY,
+                 learning_rate: float = Config.DQN_LEARNING_RATE,
+                 memory_maxlen: int = Config.DQN_MEMORY_SIZE,
+                 seed: int = RANDOM_SEED):
         self.state_size = state_size
         self.action_size = action_size
         self.gamma = gamma
         self.epsilon = epsilon
-        self.epsilon_min = 0.01
+        self.epsilon_min = Config.DQN_EPSILON_MIN
         self.epsilon_decay = epsilon_decay
         self.learning_rate = learning_rate
+        # OPTIMIZATION: Use deque for memory instead of list (O(1) append/pop)
         self.memory = deque(maxlen=memory_maxlen)
-        self.prioritized_memory = []
+        # OPTIMIZATION: Limit prioritized memory size to prevent unbounded growth
+        self.prioritized_memory = deque(maxlen=memory_maxlen)
         np.random.seed(seed)
         random.seed(seed)
         self.model = self._build_model()
 
     def _build_model(self) -> Sequential:
+        """Build neural network with Config constants for reproducibility"""
         model = Sequential()
         model.add(Input(shape=(self.state_size,)))
-        model.add(Dense(64, activation='relu', kernel_regularizer=l2(0.01)))
-        model.add(Dropout(0.2))
-        model.add(Dense(32, activation='relu', kernel_regularizer=l2(0.01)))
+        model.add(Dense(Config.NN_HIDDEN_LAYER_1, activation='relu',
+                       kernel_regularizer=l2(Config.NN_L2_REG)))
+        model.add(Dropout(Config.NN_DROPOUT_RATE))
+        model.add(Dense(Config.NN_HIDDEN_LAYER_2, activation='relu',
+                       kernel_regularizer=l2(Config.NN_L2_REG)))
         model.add(Dense(self.action_size, activation='linear'))
         model.compile(loss='mse', optimizer=Adam(learning_rate=self.learning_rate))
         return model
@@ -634,17 +745,27 @@ class Backtester:
     Backtesting routines for dynamic allocation using RL and meta-models.
     """
 
-    def compute_reward(self, portfolio_return: float, portfolio_returns_history: list) -> float:
+    def compute_reward(self, portfolio_return: float, portfolio_returns_history: np.ndarray) -> float:
         """
-        Compute reward based on the Sharpe ratio.
+        Compute reward based on the Sharpe ratio with vectorized operations.
+
+        Args:
+            portfolio_return: Current portfolio return
+            portfolio_returns_history: Array of historical returns
+
+        Returns:
+            Sharpe ratio as reward
         """
         risk_free_rate = 0
         if len(portfolio_returns_history) == 0:
             return 0
+
+        # Vectorized computation
         mean_return = np.mean(portfolio_returns_history)
         excess_return = mean_return - risk_free_rate
-        volatility = np.std(portfolio_returns_history)
+        volatility = np.std(portfolio_returns_history, ddof=1) if len(portfolio_returns_history) > 1 else np.std(portfolio_returns_history)
         sharpe_ratio = excess_return / (volatility + 1e-12)
+
         return sharpe_ratio
 
     def vectorized_backtest(self, sector_returns: pd.DataFrame, merged_macro: pd.DataFrame,
@@ -780,9 +901,21 @@ class Backtester:
 
     @staticmethod
     def calculate_portfolio_metrics(returns_log, dates) -> dict:
+        """
+        Calculate portfolio metrics with vectorized operations for better performance.
+
+        Args:
+            returns_log: Log returns series
+            dates: Date index
+
+        Returns:
+            Dictionary of performance metrics
+        """
         if not isinstance(returns_log, pd.Series):
             returns_log = pd.Series(returns_log)
+
         returns = np.exp(returns_log) - 1
+
         if returns.isnull().all() or len(returns) == 0:
             print("Warning: returns data is empty or NaN.")
             return {
@@ -792,17 +925,25 @@ class Backtester:
                 'Max Drawdown': 0,
                 'Sortino Ratio': 0
             }
+
+        # Vectorized computations
         cumulative_returns = (1 + returns).cumprod()
         total_return = cumulative_returns.iloc[-1] - 1
         annualized_return = (1 + total_return) ** (12 / len(returns)) - 1
-        annualized_volatility = np.std(returns) * np.sqrt(12)
+        annualized_volatility = returns.std() * np.sqrt(12)
         sharpe_ratio = annualized_return / annualized_volatility if annualized_volatility != 0 else 0
+
+        # Vectorized drawdown calculation
         cumulative_max = cumulative_returns.cummax()
         drawdown = (cumulative_max - cumulative_returns) / cumulative_max
         drawdown.fillna(0, inplace=True)
         max_drawdown = drawdown.max()
-        downside_deviation = np.std([r for r in returns if r < 0]) * np.sqrt(12)
+
+        # Vectorized downside deviation (more efficient)
+        negative_returns = returns[returns < 0]
+        downside_deviation = negative_returns.std() * np.sqrt(12) if len(negative_returns) > 0 else 0
         sortino_ratio = annualized_return / downside_deviation if downside_deviation != 0 else 0
+
         return {
             'Annualized Return': annualized_return,
             'Annualized Volatility': annualized_volatility,
@@ -854,14 +995,14 @@ def main():
     data_processor = DataProcessor()
     sector_returns = data_processor.compute_returns(sector_data)
     macro = data_processor.preprocess_macro(macro_data)
-    lags = [3, 6, 9, 12, 18]
+    lags = Config.DEFAULT_LAGS
     lagged_data = data_processor.future_engineering(macro, lags)
     roc_data = data_processor.rate_of_change(macro)
 
     # CRITICAL FIX: Fit scaler only on training portion to avoid forward-looking bias
-    # Determine training cutoff (75% of data for training)
+    # Determine training cutoff using Config constant
     from sklearn.preprocessing import StandardScaler
-    train_size = int(len(lagged_data) * 0.75)
+    train_size = int(len(lagged_data) * Config.TRAIN_SIZE)
 
     # Fit scalers on training data only
     numeric_cols_lagged = lagged_data.columns.difference(['date'])
@@ -887,7 +1028,7 @@ def main():
         X = merged_macro[futures[sector]]
         y = sector_returns[sector]
         # CRITICAL: Never shuffle time series data to avoid forward-looking bias
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, shuffle=False, random_state=RANDOM_SEED)
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=Config.TEST_SIZE, shuffle=False, random_state=RANDOM_SEED)
         meta_model, meta_predictions, X_stack_test, best_weights, meta_model_metrics = ensemble_trainer.train_stacking_ensemble(
             X_train, y_train, X_test, y_test, trained_models[sector], meta_model_type="RandomForest"
         )
@@ -904,8 +1045,10 @@ def main():
         for sector, models in trained_models.items():
             print(f"Precomputing SHAP values for sector: {sector}")
             shap_values_cache[sector] = {}
-            # Reduced sample size from 90 to 50 for faster computation
-            X_sample = macro_data[features[sector]].sample(n=min(50, len(macro_data)), random_state=100)
+            # CRITICAL FIX: Use sequential sampling instead of random to avoid forward-looking bias
+            # Take the most recent data points for SHAP computation
+            sample_size = min(Config.SHAP_SAMPLE_SIZE, len(macro_data))
+            X_sample = macro_data[features[sector]].iloc[-sample_size:]
             for model_name, model in zip(model_names, models):
                 if isinstance(model, (RandomForestRegressor, LGBMRegressor, XGBRegressor)):
                     explainer = shap.TreeExplainer(model)
@@ -930,12 +1073,15 @@ def main():
 
     shap_values_cache = precompute_shap_values(trained_models, merged_macro, state_size, model_names, futures)
 
-    # Run backtest
+    # Run backtest with Config constants
     backtester = Backtester()
     # Run backtest and get final allocations
     backtest_results, rewards, sharpe_ratios, final_allocations = backtester.vectorized_backtest(
         sector_returns, merged_macro, trained_models, futures, model_names,
-        action_size, weights, shap_values_cache, window_size=302, step=4
+        action_size, weights, shap_values_cache,
+        window_size=Config.BACKTEST_WINDOW_SIZE,
+        step=Config.BACKTEST_STEP,
+        batch_size=Config.DQN_BATCH_SIZE
     )
 
     # Print final allocations for each model
